@@ -1,0 +1,82 @@
+image: ubuntu:22.04
+
+variables:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: flask-app
+  ECS_CLUSTER: flask-cluster
+  ECS_SERVICE: flask-service
+  CONTAINER_NAME: flask-app
+  DOCKER_IMAGE_TAG: $CI_COMMIT_SHA
+  APP_VERSION: "1.0.0"
+
+stages:
+  - lint
+  - test
+  - build
+  - deploy
+
+cache:
+  paths:
+    - .cache/pip
+
+before_script:
+  - apt-get update -y
+  - apt-get install -y python3-pip python3-venv docker.io curl unzip
+  - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+  - unzip awscliv2.zip
+  - ./aws/install
+  - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+  - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+  - aws configure set region $AWS_REGION
+
+  - python3 -m venv venv
+  - source venv/bin/activate
+  - pip install -r requirements.txt
+
+lint:
+  stage: lint
+  script:
+    - pylint app/
+  only:
+    - merge_requests
+    - main
+
+test:
+  stage: test
+  script:
+    - cd app
+    - pytest --cov=. --cov-report=term-missing
+  coverage: '/TOTAL.+ ([0-9]{1,3}%)/'
+  only:
+    - merge_requests
+    - main
+
+build:
+  stage: build
+  script:
+    # Start Docker service
+    - service docker start
+    # Login to AWS ECR
+    - aws ecr get-login-password | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+    # Build Docker image
+    - docker build -t $ECR_REPOSITORY:$DOCKER_IMAGE_TAG 
+      --build-arg APP_VERSION=$APP_VERSION .
+    - docker tag $ECR_REPOSITORY:$DOCKER_IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$DOCKER_IMAGE_TAG
+    - docker tag $ECR_REPOSITORY:$DOCKER_IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
+    # Push to ECR
+    - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$DOCKER_IMAGE_TAG
+    - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest
+  only:
+    - main
+
+deploy:
+  stage: deploy
+  script:
+    # Update ECS task definition
+    - aws ecs describe-task-definition --task-definition $CONTAINER_NAME --query "taskDefinition" > task-definition.json
+    - sed -i "s|$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:[^\"]*|$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:$DOCKER_IMAGE_TAG|g" task-definition.json
+    - aws ecs register-task-definition --cli-input-json file://task-definition.json
+    # Update ECS service
+    - aws ecs update-service --cluster $ECS_CLUSTER --service $ECS_SERVICE --task-definition $CONTAINER_NAME --force-new-deployment
+  only:
+    - main
